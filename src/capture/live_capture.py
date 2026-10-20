@@ -1,5 +1,6 @@
 """
 live_capture.py — Demo-ready IDS with fast detection + colored output
+macOS lo0 compatible via conf.use_pcap = True
 """
 
 import time
@@ -7,6 +8,12 @@ import queue
 import joblib
 import threading
 import numpy as np
+from collections import defaultdict
+
+# ── macOS lo0 fix (must be before any other scapy imports) ────────────────────
+from scapy.all import conf
+conf.use_pcap = True
+
 from scapy.all import sniff, IP, TCP, UDP
 
 from src.capture.flow_builder import FlowTracker
@@ -18,15 +25,79 @@ GREEN  = "\033[92m"; YELLOW = "\033[93m"; RED    = "\033[91m"
 CYAN   = "\033[96m"; WHITE  = "\033[97m"; BLUE   = "\033[94m"
 
 # ── Config ────────────────────────────────────────────────────────────────────
-EVAL_INTERVAL    = 2.0   # check for new flows every 1.5s
-DEDUP_TTL        = 30     # don't re-alert same flow for 30s
-MAX_BENIGN_LOGS  = 2      # max benign lines per cycle
-SIMULATE_ATTACKS = True   # demo heuristics on top of ML
+EVAL_INTERVAL    = 0.5
+DEDUP_TTL        = 20
+MAX_BENIGN_LOGS  = 2
+SIMULATE_ATTACKS = True
 
 result_queue: queue.Queue = queue.Queue()
 _seen_flows: dict = {}
 _seen_lock = threading.Lock()
 _stats = {'total': 0, 'alerts': 0, 'benign': 0, 'start': time.time()}
+
+# ── Packet-level scan tracker ─────────────────────────────────────────────────
+_scan_tracker: dict = {}
+_scan_lock    = threading.Lock()
+SCAN_WINDOW   = 6.0   # seconds
+SCAN_THRESH   = 10    # unique ports to trigger alert
+
+# ── Packet-level flood tracker ────────────────────────────────────────────────
+_flood_tracker: dict = {}
+_flood_lock   = threading.Lock()
+FLOOD_WINDOW  = 2.0   # seconds
+FLOOD_THRESH  = 300   # packets within window to trigger alert
+
+def _track_syn_packet(src: str, dst: str, dport: int):
+    """Called for every SYN. Returns alert dict if scan threshold crossed, else None."""
+    now = time.time()
+    key = (src, dst)
+    with _scan_lock:
+        if key not in _scan_tracker:
+            _scan_tracker[key] = {'ports': set(), 'first_seen': now, 'last_alert': 0.0}
+        entry = _scan_tracker[key]
+        if now - entry['first_seen'] > SCAN_WINDOW:
+            entry['ports']      = set()
+            entry['first_seen'] = now
+        entry['ports'].add(dport)
+        count = len(entry['ports'])
+        if count >= SCAN_THRESH and (now - entry['last_alert']) > DEDUP_TTL:
+            entry['last_alert'] = now
+            conf_val = min(99.0, 78.2 + (count - SCAN_THRESH) * 0.5)
+            elapsed  = max(now - entry['first_seen'], 0.001)
+            return {
+                'label': 'PortScan', 'confidence': round(conf_val, 1),
+                'risk_level': 'HIGH', 'top_features': {},
+                '_src': src, '_dst': dst, '_dport': str(dport), '_proto': 'TCP',
+                'Total Fwd Packets': count, 'Total Bwd Packets': 0,
+                'Flow Packets/s': count / elapsed,
+            }
+    return None
+
+def _track_flood_packet(src: str, dst: str, dport: int):
+    """Called for every TCP packet. Returns alert dict if flood threshold crossed, else None."""
+    now = time.time()
+    key = (src, dst, dport)
+    with _flood_lock:
+        if key not in _flood_tracker:
+            _flood_tracker[key] = {'count': 0, 'first_seen': now, 'last_alert': 0.0}
+        entry = _flood_tracker[key]
+        if now - entry['first_seen'] > FLOOD_WINDOW:
+            entry['count']      = 0
+            entry['first_seen'] = now
+        entry['count'] += 1
+        count = entry['count']
+        if count >= FLOOD_THRESH and (now - entry['last_alert']) > DEDUP_TTL:
+            entry['last_alert'] = now
+            elapsed = max(now - entry['first_seen'], 0.001)
+            pps     = count / elapsed
+            return {
+                'label': 'DoS-Hulk', 'confidence': 92.1,
+                'risk_level': 'CRITICAL', 'top_features': {},
+                '_src': src, '_dst': dst, '_dport': str(dport), '_proto': 'TCP',
+                'Total Fwd Packets': count, 'Total Bwd Packets': 0,
+                'Flow Packets/s': pps,
+            }
+    return None
 
 # ── Deduplication ─────────────────────────────────────────────────────────────
 def _is_duplicate(key: tuple) -> bool:
@@ -37,50 +108,31 @@ def _is_duplicate(key: tuple) -> bool:
         _seen_flows[key] = now
         return False
 
-# ── Heuristics (demo attack simulation) ───────────────────────────────────────
+# ── Heuristics (per-flow fallback) ────────────────────────────────────────────
 def _apply_heuristics(feat: dict, result: dict) -> dict:
-    """
-    Rule-based overrides so real localhost traffic triggers alerts.
-    Only fires when model says BENIGN. Tuned for Mac localhost demo.
-    """
     if not SIMULATE_ATTACKS or result['label'].upper() != 'BENIGN':
         return result
 
     syn      = feat.get('SYN Flag Count', 0)
     ack      = feat.get('ACK Flag Count', 0)
     rst      = feat.get('RST Flag Count', 0)
-    fin      = feat.get('FIN Flag Count', 0)
     fwd      = feat.get('Total Fwd Packets', 0)
     bwd      = feat.get('Total Bwd Packets', 0)
     pps      = feat.get('Flow Packets/s', 0)
     bps      = feat.get('Flow Bytes/s', 0)
-    duration = feat.get('Flow Duration', 1)   # microseconds
-    total=fwd+bwd;
-    
-    # hping3 flood → VERY high packet rate → DDoS
- # nmap SYN scan: many SYN, zero or few ACK, many RST responses
+    duration = feat.get('Flow Duration', 1)
+
     if syn >= 3 and rst >= 2 and ack < syn:
         result.update({'label': 'PortScan',     'confidence': 91.2, 'risk_level': 'HIGH'})
-
-    # nmap intense: lots of packets, mix of flags, very short flows
-    elif syn >= 2 and fwd >= 5 and duration < 500_000:   # < 0.5s
+    elif syn >= 3 and fwd >= 8 and duration < 1_000_000:
         result.update({'label': 'PortScan',     'confidence': 84.7, 'risk_level': 'HIGH'})
-
-    # hping3 flood: massive packet rate (even localhost flood hits >50 pps)
-        
-    elif pps > 500:
-        result.update({'label': 'DoS-Hulk',   'confidence': 92.1, 'risk_level': 'CRITICAL'})
-
-    # Python socket flood (connect() loop): many fwd, no bwd, high RST
-    elif fwd > 30 and bwd == 0 and rst > 5:
+    elif pps > 800 and duration > 50_000:
+        result.update({'label': 'DoS-Hulk',     'confidence': 92.1, 'risk_level': 'CRITICAL'})
+    elif fwd > 50 and bwd == 0 and rst > 10:
         result.update({'label': 'DDoS-Connect', 'confidence': 88.9, 'risk_level': 'CRITICAL'})
-
-    # Asymmetric probe: many forward packets, no responses at all
-    elif fwd > 15 and bwd == 0:
+    elif fwd > 25 and bwd == 0 and duration > 200_000:
         result.update({'label': 'Probe',        'confidence': 76.4, 'risk_level': 'MEDIUM'})
-
-    # Bulk transfer: large bytes, few packets = possible exfil
-    elif bps > 500_000 and fwd + bwd < 8:
+    elif bps > 500_000 and fwd + bwd < 8 and duration > 50_000:
         result.update({'label': 'Exfiltration', 'confidence': 69.8, 'risk_level': 'HIGH'})
 
     return result
@@ -131,7 +183,7 @@ def _print_flow(result: dict, feat: dict, is_alert: bool):
 
     if is_alert:
         print(f"\n  {RED}{BOLD}{'▶'*3} THREAT DETECTED {'◀'*3}{RESET}")
-    
+
     print(f"  {DIM}{ts}{RESET}  {badge}  "
           f"{color}{BOLD}{label:<18}{RESET}  "
           f"{WHITE}{conf:.1f}%{RESET}  "
@@ -148,6 +200,13 @@ def _print_flow(result: dict, feat: dict, is_alert: bool):
             print(f"  {YELLOW}  ▸ SHAP: {parts}{RESET}")
         print(f"  {RED}{'─'*60}{RESET}\n")
 
+def _fire_alert(alert: dict):
+    """Print and queue a packet-level alert (scan or flood)."""
+    _stats['total']  += 1
+    _stats['alerts'] += 1
+    _print_flow(alert, alert, True)
+    result_queue.put({**alert, 'timestamp': time.time()})
+
 # ── Active flow fallback ──────────────────────────────────────────────────────
 def _extract_active_features(tracker: FlowTracker) -> list:
     if not tracker.flows:
@@ -158,7 +217,6 @@ def _extract_active_features(tracker: FlowTracker) -> list:
     ]
     if not candidates:
         return []
-    # Take top 3 busiest active flows
     candidates.sort(key=lambda kv: len(kv[1].fwd_pkts) + len(kv[1].bwd_pkts), reverse=True)
     results = []
     for key, flow in candidates[:3]:
@@ -172,13 +230,11 @@ def _extract_active_features(tracker: FlowTracker) -> list:
 
 # ── Classify one flow ─────────────────────────────────────────────────────────
 def _classify(feat: dict, feat_cols, scaler, predictor) -> dict:
-    row = np.array([feat.get(c, 0.0) for c in feat_cols])
+    row    = np.array([feat.get(c, 0.0) for c in feat_cols])
     scaled = scaler.transform(row.reshape(1, -1))
     result = predictor.predict(scaled)[0]
-    # attach SHAP explanation
     try:
         from src.models.explain import explain_single
-        explainer_path = 'data/models/shap_explainer.pkl'
         result['top_features'] = explain_single(scaled[0], feat_cols)
     except Exception:
         result['top_features'] = {}
@@ -192,26 +248,47 @@ def start_capture(interface=None, duration=None):
     feat_cols = joblib.load('data/models/feature_cols.pkl')
 
     _print_banner()
-    print(f"  {CYAN}Interface  : {interface or 'default (all)' }{RESET}")
+    print(f"  {CYAN}Interface  : {interface or 'default (all)'}{RESET}")
     print(f"  {CYAN}Eval cycle : every {EVAL_INTERVAL}s{RESET}")
     print(f"  {CYAN}Dedup TTL  : {DEDUP_TTL}s{RESET}")
     print(f"  {CYAN}Demo mode  : {'ON — heuristics active' if SIMULATE_ATTACKS else 'OFF'}{RESET}")
     _print_separator()
     print(f"  {DIM}Listening for traffic…{RESET}\n")
 
-    last_eval    = [time.time()]
-    last_stats   = [time.time()]
+    last_eval  = [time.time()]
+    last_stats = [time.time()]
 
     def packet_callback(pkt):
         if IP not in pkt:
             return
 
-        src, dst, plen, proto = pkt[IP].src, pkt[IP].dst, len(pkt), pkt[IP].proto
+        src   = pkt[IP].src
+        dst   = pkt[IP].dst
+        plen  = len(pkt)
+        proto = pkt[IP].proto
         sport = dport = 0
         flags = None
 
         if TCP in pkt:
-            sport, dport, flags = pkt[TCP].sport, pkt[TCP].dport, pkt[TCP].flags
+            sport = pkt[TCP].sport
+            dport = pkt[TCP].dport
+            flags = pkt[TCP].flags
+
+            # ── Packet-level detection (runs on EVERY packet, no flow needed) ──
+            if SIMULATE_ATTACKS:
+                # SYN-only packets → scan detection
+                if flags and (int(flags) & 0x02) and not (int(flags) & 0x10):
+                    alert = _track_syn_packet(src, dst, dport)
+                    if alert:
+                        _fire_alert(alert)
+                        return
+
+                # All TCP packets → flood detection
+                alert = _track_flood_packet(src, dst, dport)
+                if alert:
+                    _fire_alert(alert)
+                    return
+
         elif UDP in pkt:
             sport, dport = pkt[UDP].sport, pkt[UDP].dport
 
@@ -219,7 +296,6 @@ def start_capture(interface=None, duration=None):
 
         now = time.time()
 
-        # Print stats bar every 15 seconds
         if now - last_stats[0] >= 15:
             last_stats[0] = now
             _print_stats()
@@ -228,7 +304,7 @@ def start_capture(interface=None, duration=None):
             return
         last_eval[0] = now
 
-        # Get completed flows first, fall back to active
+        # ── Flow-level ML classification ──────────────────────────────────────
         features_list = tracker.get_completed_features()
         if not features_list:
             features_list = _extract_active_features(tracker)
@@ -265,7 +341,9 @@ def start_capture(interface=None, duration=None):
             _print_flow(result, feat, is_alert)
             result_queue.put({**result, 'timestamp': now})
 
-    sniff(iface=interface, prn=packet_callback, store=False, timeout=duration)
+    sniff(iface=interface, prn=packet_callback, store=False,
+          timeout=duration, filter="ip")
+
 
 if __name__ == '__main__':
-    start_capture()
+    start_capture(interface='lo0')

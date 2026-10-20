@@ -1,2 +1,10 @@
 data/
 *.csv
+
+.env
+.DS_Store
+__pycache__/
+*.pyc
+*.pkl
+*.h5
+*.zip
